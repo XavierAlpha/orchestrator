@@ -1,0 +1,47 @@
+globals:
+  workspace_dir: "workspace"
+  default_go_version: "${GO_DEFAULT_VERSION}"
+
+repos:
+  - name: sing-box
+    git_url: https://github.com/sagernet/sing-box.git
+    version: "${SINGBOX_VERSION}" # tag/sha or branch below
+    branch: "${SINGBOX_BRANCH}"
+    go_version: "${SINGBOX_GO_VERSION}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+      - windows/amd64
+    build_args: |
+      build \
+      -v \
+      -trimpath \
+      -buildvcs=false \
+      -tags="${SINGBOX_TAGS}" \
+      -ldflags="-X github.com/sagernet/sing-box/constant.Version=${SINGBOX_VERSION} -s -w -buildid=" \
+      -o \
+      "${OUTPUT}" \
+      ./cmd/sing-box
+    env:
+      SINGBOX_TAGS: "${SINGBOX_TAGS}"
+
+  - name: xray-core
+    git_url: https://github.com/XTLS/Xray-core.git
+    version: "${XRAY_VERSION}"
+    branch: "${XRAY_BRANCH}"
+    go_version: "${XRAY_GO_VERSION}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+      - windows/amd64
+    build_args: |
+      build \
+      -v \
+      -trimpath \
+      -buildvcs=false \
+      -ldflags="-X github.com/xtls/xray-core/core.build=${SHORT_SHA} -s -w -buildid=" \
+      -o \
+      "${OUTPUT}" \
+      ./main
+    env: {}
+
