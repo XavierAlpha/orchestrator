@@ -1,105 +1,83 @@
-name: Build & Release All Repositories
+name: Matrix Build
 
 on:
+#  schedule:
+#    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
-      singbox_version:
-        description: "Sing-Box (tag/branch/commit), default: branch: dev-next"
+      extra_envs:
+        description: "EXTRA_ENVS: KEY=VAL,KEY2=VAL2"
         required: false
-        default: ""
-      xraycore_version:
-        description: "Xray-Core (tag/branch/commit), default: branch: main"
-        required: false
-        default: ""
+        default: ''
   push:
    branches-ignore:
      - '*'
 
+env:
+  DEFAULT_WORKSPACE_DIR: workspace
+  DEFAULT_GO_VERSION:   1.24.4
+  WORKSPACE_DIR:        workspace
+
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+        fail-fast: false
+        matrix:
+          include:
+            - repo:   sing-box
+              url:    https://github.com/sagernet/sing-box.git
+              refs:   dev-next,main-next
+              plats:  linux/amd64,linux/arm64,windows/amd64
+              gover:  1.23.1
+              tags:   'with_gvisor,with_quic,with_utls,with_clash_api'
+              ldf:    '-X github.com/sagernet/sing-box/constant.Version=${VERSION_TAG} -s -w -buildid='
+              extra:  ''
+            - repo:   xray-core
+              url:    https://github.com/XTLS/Xray-core.git
+              refs:   main
+              plats:  linux/amd64,linux/arm64,windows/amd64
+              gover:  1.24.4
+              tags:   ''
+              ldf:    '-X github.com/xtls/xray-core/core.build=${SHORT_SHA} -s -w -buildid='
+              extra:  ''
     steps:
-      - name: Restore sing-box SHA cache
-        uses: actions/cache@v4
-        with:
-          key: last-sha-sing-box-${{ github.ref_name }}
-          path: workspace/sing-box/.last_build_sha
-
-      - name: Restore xray-core SHA cache
-        uses: actions/cache@v4
-        with:
-          key: last-sha-xray-core-${{ github.ref_name }}
-          path: workspace/xray-core/.last_build_sha
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Determine Sing-Box Version
-        id: sb_ver
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const inputVer = "${{ github.event.inputs.singbox_version }}".trim();
-            if (inputVer !== "") {
-              return { version: inputVer };
-            }
-            return { version: "" };
-      - name: Determine Xray-Core Version
-        id: xr_ver
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const inputVer = "${{ github.event.inputs.xraycore_version }}.trim()";
-            if (inputVer && inputVer.trim() !== "") {
-              return { version: inputVer };
-            }
-            return { version: "" };
-      - name: Clone Target Repos
-        env:
-          SINGBOX_VERSION: ${{ steps.sb_ver.outputs.singbox_version }}
-          XRAY_VERSION:     ${{ steps.xr_ver.outputs.xraycore_version }}
+
+      - if: ${{ github.event.inputs.extra_envs != '' }}
         run: |
-          set -eux
+          echo "Setting extra environment variables"
+          echo "${{ github.event.inputs.extra_envs }}" | tr ',' '\n' >> $GITHUB_ENV
 
-          mkdir -p workspace
-          if [ -n "${SINGBOX_VERSION}" ]; then
-            echo "Cloning sing-box at version ${SINGBOX_VERSION}"
-            git clone --depth 1 --branch "${SINGBOX_VERSION}" https://github.com/sagernet/sing-box.git workspace/sing-box
-          else
-            echo "Cloning sing-box at default branch 'dev-next'"
-            git clone --depth 1 --branch "dev-next" https://github.com/sagernet/sing-box.git workspace/sing-box
-          fi
-
-          if [ -n "${XRAY_VERSION}" ]; then
-            echo "Cloning xray-core at version ${XRAY_VERSION}"
-            git clone --depth 1 --branch "${XRAY_VERSION}" https://github.com/XTLS/Xray-core.git workspace/xray-core
-          else
-            echo "Cloning xray-core at default branch 'main'"
-            git clone --depth 1 --branch "main" https://github.com/XTLS/Xray-core.git workspace/xray-core
-          fi
-
-      - name: Setup Go (goenv)
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ matrix.gover }}
 
-      - name: Run Orchestrator (Build)
-        env:
-          GO_DEFAULT_VERSION: "1.24.4"
-
-          SINGBOX_VERSION: "${{ steps.sb_ver.outputs.version }}"
-          SINGBOX_BRANCH: "dev-next"
-          SINGBOX_GO_VERSION: "1.23.1"
-          SINGBOX_TAGS: "with_gvisor,with_quic,with_utls,with_clash_api"
-
-          XRAY_VERSION: "${{ steps.xr_ver.outputs.version }}"
-          XRAY_BRANCH: "main"
-          XRAY_GO_VERSION: "1.24.4"
+      - name: Build matrix refs / plats
+        shell: bash
         run: |
-          go run main.go
+          set -ex
+          IFS=',' read -ra REFARR  <<<"${{ matrix.refs }}"
+          IFS=',' read -ra PLATARR <<<"${{ matrix.plats }}"
+          for REF in "${REFARR[@]}"; do
+            for P in "${PLATARR[@]}"; do
+              echo "::group::${{ matrix.repo }}  $REF  $P"
+              env \
+                REPO="${{ matrix.repo }}" \
+                REPO_URL="${{ matrix.url }}" \
+                REF="$REF" \
+                PLATFORM="$P" \
+                BUILD_TAGS="${{ matrix.tags }}" \
+                BUILD_LDFLAGS="${{ matrix.ldf }}" \
+                EXTRA_ENVS="${{ matrix.extra }}" \
+                go run main.go
+              echo "::endgroup::"
+            done
+          done
 
       - name: Upload raw-binaries
         uses: actions/upload-artifact@v4
@@ -107,62 +85,50 @@ jobs:
           name: raw-binaries
           path: workspace/**/artifacts/**
 
-      - name: Save sing-box SHA cache
-        uses: actions/cache@v4
-        with:
-          key: last-sha-sing-box-${{ github.ref_name }}
-          path: workspace/sing-box/.last_build_sha
+      - name: Export ref-platform list
+        id: matrixgen
+        shell: bash
+        run: |
+          set -eu
+          JSON="[]"
+          for repo in "${{ matrix.repo }}"; do
+            if [ ! -d "workspace/$repo" ]; then continue; fi
+            for ref in $(ls workspace/$repo); do
+              for plat in $(ls workspace/$repo/$ref); do
+                JSON=$(jq -c \
+                  --arg r "$repo" --arg ref "$ref" --arg plat "$plat" \
+                  '. += [{"repo":$r,"ref":$ref,"plat":$plat}]' \
+                  <<<"$JSON")
+              done
+            done
+          done
+          echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
+    outputs:
+        matrix: ${{ steps.matrixgen.outputs.matrix }}
 
-      - name: Save xray-core SHA cache
-        uses: actions/cache@v4
-        with:
-          key: last-sha-xray-core-${{ github.ref_name }}
-          path: workspace/xray-core/.last_build_sha
 
   upload:
     needs: build
     runs-on: ubuntu-latest
-
     strategy:
-      matrix:
-        repo: [sing-box, xray-core]
-        os_arch:
-          - { os: linux,   arch: amd64 }
-          - { os: linux,   arch: arm64 }
-          - { os: windows, arch: amd64 }
-    env:
-      SB_VER: ${{ needs.build.outputs.sb_version }}
-      XR_VER: ${{ needs.build.outputs.xr_version }}
+      fail-fast: false
+      matrix: ${{ fromJson(needs.build.outputs.matrix) }}
 
     steps:
-      - name: Download raw binaries
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: raw-binaries
 
-      - name: Determine version
-        id: setver
+      - name: Flatten binary
         shell: bash
         run: |
-          if [[ "${{ matrix.repo }}" == "sing-box" ]]; then
-          echo "version=${SB_VER:-dev-next}" >> "$GITHUB_OUTPUT"
-          else
-          echo "version=${XR_VER:-main}" >> "$GITHUB_OUTPUT"
-          fi
+          set -eu
+          SRC="${{ matrix.repo }}/${{ matrix.ref }}/${{ matrix.plat }}/${{ matrix.repo }}"
+          OUT="${{ matrix.repo }}-${{ matrix.ref }}-${{ matrix.plat }}"
+          [[ "${{ matrix.plat }}" == windows/* ]] && OUT="${OUT}.exe"
+          cp "$SRC" "$OUT"
 
-      - name: Copy and flatten binary
-        shell: bash
-        run: |
-          set -eux
-          PLAT="${{ matrix.os_arch.os }}-${{ matrix.os_arch.arch }}"
-          SRC="${{ matrix.repo }}/workspace/${{ matrix.repo }}/artifacts/${{ matrix.repo }}-${PLAT}"
-          DST="${{ matrix.repo }}-${{ steps.setver.outputs.version }}-${PLAT}"
-          echo "Copying from: $SRC"
-          echo "        to: $DST"
-          cp "$SRC" "$DST"
-
-      - name: Upload flattened binary
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo }}-${{ steps.setver.outputs.version }}-${{ matrix.os_arch.os }}-${{ matrix.os_arch.arch }}
-          path: ${{ matrix.repo }}-${{ steps.setver.outputs.version }}-${{ matrix.os_arch.os }}-${{ matrix.os_arch.arch }}
+          name: ${{ matrix.repo }}-${{ matrix.ref }}-${{ matrix.plat }}
+          path: ${{ matrix.repo }}-${{ matrix.ref }}-${{ matrix.plat }}*

@@ -1,47 +1,26 @@
 globals:
-  workspace_dir: "workspace"
-  default_go_version: "${GO_DEFAULT_VERSION}"
+  default_workspace_dir: "${DEFAULT_WORKSPACE_DIR}"   # e.g. ./workspace
+  default_go_version:    "${DEFAULT_GO_VERSION}"      # e.g. 1.24
 
-repos:
-  - name: sing-box
-    git_url: https://github.com/sagernet/sing-box.git
-    version: "${SINGBOX_VERSION}" # tag/sha or branch below
-    branch: "${SINGBOX_BRANCH}"
-    go_version: "${SINGBOX_GO_VERSION}"
-    platforms:
-      - linux/amd64
-      - linux/arm64
-      - windows/amd64
-    build_args: |
-      build \
-      -v \
-      -trimpath \
-      -buildvcs=false \
-      -tags="${SINGBOX_TAGS}" \
-      -ldflags="-X github.com/sagernet/sing-box/constant.Version=${SINGBOX_VERSION} -s -w -buildid=" \
-      -o \
-      "${OUTPUT}" \
-      ./cmd/sing-box
-    env:
-      SINGBOX_TAGS: "${SINGBOX_TAGS}"
+assets:
+  sing-box:
+    workspace:        "${WORKSPACE_DIR}"
+    url:              "https://github.com/sagernet/sing-box.git"
+    build_go_version: "${SB_GO_VERSION}"
+    build_commits:    "${SB_COMMITS}"      # comma
+    build_branches:   "${SB_BRANCHES}"     # comma
+    build_platforms:  "${SB_PLATFORMS}"    # comma linux/amd64,etc.
+    build_tags:       "${SB_TAGS}"         # e.g. with_gvisor,with_quic
+    build_ldflags:    "${SB_LDFLAGS}"      # may contain ${SHORT_SHA}/${VERSION_TAG}
+    envs:             "${SB_EXTRA_ENVS}"   # KEY=VAL,KEY2=VAL2
 
-  - name: xray-core
-    git_url: https://github.com/XTLS/Xray-core.git
-    version: "${XRAY_VERSION}"
-    branch: "${XRAY_BRANCH}"
-    go_version: "${XRAY_GO_VERSION}"
-    platforms:
-      - linux/amd64
-      - linux/arm64
-      - windows/amd64
-    build_args: |
-      build \
-      -v \
-      -trimpath \
-      -buildvcs=false \
-      -ldflags="-X github.com/xtls/xray-core/core.build=${SHORT_SHA} -s -w -buildid=" \
-      -o \
-      "${OUTPUT}" \
-      ./main
-    env: {}
-
+  xray-core:
+    workspace:        "${WORKSPACE_DIR}"
+    url:              "https://github.com/XTLS/Xray-core.git"
+    build_go_version: "${XR_GO_VERSION}"
+    build_commits:    "${XR_COMMITS}"
+    build_branches:   "${XR_BRANCHES}"
+    build_platforms:  "${XR_PLATFORMS}"
+    build_tags:       "${XR_TAGS}"
+    build_ldflags:    "${XR_LDFLAGS}"
+    envs:             "${XR_EXTRA_ENVS}"

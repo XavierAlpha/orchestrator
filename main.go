@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"encoding/csv"
 	"github.com/spf13/viper"
 	"log"
 	"os"
@@ -10,50 +10,105 @@ import (
 	"strings"
 )
 
-type GlobalConfig struct {
-	WorkspaceDir     string `mapstructure:"workspace_dir" yaml:"workspace_dir"`
-	DefaultGoVersion string `mapstructure:"default_go_version" yaml:"default_go_version"`
+type GlobalCfg struct {
+	DefaultWorkspaceDir string `mapstructure:"default_workspace_dir"`
+	DefaultGoVersion    string `mapstructure:"default_go_version"`
+}
+type RepoCfg struct {
+	Workspace string `mapstructure:"workspace"`
+	URL       string `mapstructure:"url"`
+	GoVer     string `mapstructure:"build_go_version"`
+	Commits   string `mapstructure:"build_commits"`
+	Branches  string `mapstructure:"build_branches"`
+	Plats     string `mapstructure:"build_platforms"`
+	Tags      string `mapstructure:"build_tags"`
+	Ldflags   string `mapstructure:"build_ldflags"`
+	Envs      string `mapstructure:"envs"`
+}
+type Root struct {
+	Globals GlobalCfg          `mapstructure:"globals"`
+	Assets  map[string]RepoCfg `mapstructure:"assets"`
 }
 
-type RepoConfig struct {
-	Name      string            `mapstructure:"name"         yaml:"name"`
-	GitURL    string            `mapstructure:"git_url"      yaml:"git_url"`
-	Version   string            `mapstructure:"version"      yaml:"version"`
-	Branch    string            `mapstructure:"branch"       yaml:"branch"`
-	GoVersion string            `mapstructure:"go_version"   yaml:"go_version"`
-	Platforms []string          `mapstructure:"platforms"    yaml:"platforms"`
-	BuildArgs string            `mapstructure:"build_args"   yaml:"build_args"`
-	Env       map[string]string `mapstructure:"env"          yaml:"env"`
-}
-
-type RootConfig struct {
-	Globals GlobalConfig `yaml:"globals"`
-	Repos   []RepoConfig `yaml:"repos"`
-}
-
-func runCommand(dir string, env []string, cmdName string, args ...string) error {
-	cmd := exec.Command(cmdName, args...)
-	cmd.Dir = dir
-	if env != nil {
-		cmd.Env = env
+func splitCSV(s string) []string {
+	r, _ := csv.NewReader(strings.NewReader(s)).Read()
+	var out []string
+	for _, v := range r {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			out = append(out, v)
+		}
 	}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	return out
+}
+
+func run(dir string, env []string, bin string, args ...string) error {
+	cmd := exec.Command(bin, args...)
+	cmd.Dir, cmd.Env = dir, env
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	return cmd.Run()
 }
 
-func outputCommand(dir string, env []string, cmdName string, args ...string) (string, error) {
-	cmd := exec.Command(cmdName, args...)
-	cmd.Dir = dir
-	if env != nil {
-		cmd.Env = env
-	}
-	out, err := cmd.Output()
+func git(dir string, args ...string) (string, error) {
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
 	return strings.TrimSpace(string(out)), err
 }
 
-func expandEnv(s string) string {
-	return os.ExpandEnv(s)
+func repl(s, sha, tag, out string) string {
+	return strings.NewReplacer(
+		"${SHORT_SHA}", sha,
+		"${VERSION_TAG}", tag,
+		"${OUTPUT}", out,
+	).Replace(s)
+}
+
+func compile(repo, ref, plat string, rc RepoCfg, g GlobalCfg) error {
+	workspace := os.ExpandEnv(rc.Workspace)
+	if workspace == "" {
+		workspace = g.DefaultWorkspaceDir
+	}
+	repoDir := filepath.Join(workspace, repo)
+	if !exists(repoDir) {
+		if err := os.MkdirAll(workspace, 0755); err != nil {
+			log.Fatalf("[%s] cannot create workspace: %v", repo, err)
+		}
+	}
+
+	if err := run(repoDir, nil, "git", "checkout", ref); err != nil {
+		return err
+	}
+	shortSHA, _ := git(repoDir, "rev-parse", "--short=7", "HEAD")
+	tag, _ := git(repoDir, "describe", "--tags", "--abbrev=0")
+
+	outDir := filepath.Join(workspace, repo, ref, plat)
+	_ = os.MkdirAll(outDir, 0755)
+	outFile := filepath.Join(outDir, repo)
+
+	env := os.Environ()
+	osArch := strings.SplitN(plat, "/", 2)
+	env = append(env,
+		"GOOS="+osArch[0],
+		"GOARCH="+osArch[1],
+		"CGO_ENABLED=0",
+		"SHORT_SHA="+shortSHA,
+		"VERSION_TAG="+tag,
+		"OUTPUT="+outFile,
+	)
+	for _, kv := range splitCSV(os.ExpandEnv(rc.Envs)) {
+		env = append(env, kv)
+	}
+
+	args := []string{"build", "-v", "-trimpath", "-buildvcs=false"}
+	if rc.Tags != "" {
+		args = append(args, "-tags", repl(rc.Tags, shortSHA, tag, outFile))
+	}
+	if rc.Ldflags != "" {
+		args = append(args, "-ldflags", repl(rc.Ldflags, shortSHA, tag, outFile))
+	}
+	args = append(args, "-o", outFile, "./...")
+
+	log.Printf("→ %s %v", "go", args)
+	return run(repoDir, env, "go", args...)
 }
 
 func exists(path string) bool {
@@ -61,109 +116,11 @@ func exists(path string) bool {
 	return err == nil
 }
 
-func orchestrateOne(globals GlobalConfig, repo RepoConfig) {
-	workDir := expandEnv(repo.Env["WORKSPACE"])
-	if workDir == "" {
-		workDir = globals.WorkspaceDir
+func cloneOrFetch(dir, url string) error {
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		return run(dir, nil, "git", "fetch", "--all", "--prune")
 	}
-
-	repoDir := filepath.Join(workDir, repo.Name)
-	if !exists(repoDir) {
-		if err := os.MkdirAll(workDir, 0755); err != nil {
-			log.Fatalf("[%s] cannot create workspace: %v", repo.Name, err)
-		}
-	}
-
-	ver := expandEnv(repo.Version)
-	branch := expandEnv(repo.Branch)
-	if ver == "" && branch == "" {
-		log.Fatalf("[%s] both version and branch are empty", repo.Name)
-	}
-	version := ver
-	if version == "" {
-		version = branch
-	}
-
-	if exists(filepath.Join(repoDir, ".git")) {
-		log.Printf("[%s] git fetch & checkout %s", repo.Name, version)
-		_ = runCommand(repoDir, nil, "git", "fetch", "--all", "--prune")
-		if err := runCommand(repoDir, nil, "git", "checkout", version); err != nil {
-			log.Fatalf("[%s] git checkout %s failed: %v", repo.Name, version, err)
-		}
-		_ = runCommand(repoDir, nil, "git", "pull", "--ff-only", "origin", version)
-	} else {
-		log.Printf("[%s] git clone %s (ref=%s)", repo.Name, repo.GitURL, version)
-		if err := runCommand(workDir, nil,
-			"git", "clone", "--branch", version, "--single-branch", repo.GitURL, repo.Name,
-		); err != nil {
-			log.Fatalf("[%s] git clone failed: %v", repo.Name, err)
-		}
-	}
-
-	if version == branch {
-		log.Printf("[%s] Prepare version: Fetch Tag ...", repo.Name)
-		_ = runCommand(repoDir, nil, "git", "fetch", "-q", "--tags")
-		if tag, err := outputCommand(repoDir, nil, "git", "describe", "--tags", "--abbrev=0"); err != nil {
-			log.Printf("[%s] Latest Tag = %s", repo.Name, tag)
-			version = tag
-		} else {
-			log.Printf("[%s] No Latest Tag： %v", repo.Name, err)
-		}
-	}
-
-	shortSHA, _ := outputCommand(repoDir, nil, "git", "rev-parse", "--short=7", "HEAD")
-	lastSHAFile := filepath.Join(repoDir, ".last_build_sha")
-	prev, _ := os.ReadFile(lastSHAFile)
-	if string(prev) == shortSHA && shortSHA != "" {
-		log.Printf("[%s] no changes since %s, skip", repo.Name, shortSHA)
-		return
-	}
-	log.Printf("[%s] new commit shortSHA %s", repo.Name, shortSHA)
-
-	goVer := expandEnv(repo.GoVersion)
-	if goVer == "" {
-		goVer = globals.DefaultGoVersion
-	}
-	_ = runCommand("", nil, "go", "install", fmt.Sprintf("golang.org/dl/go%s@latest", goVer))
-	_ = runCommand("", nil, fmt.Sprintf("go%s", goVer), "download")
-	goBin := fmt.Sprintf("go%s", goVer)
-	_ = runCommand(repoDir, nil, goBin, "mod", "tidy")
-
-	artifactsDir := filepath.Join(repoDir, "artifacts")
-	_ = os.MkdirAll(artifactsDir, 0755)
-
-	for _, platform := range repo.Platforms {
-		parts := strings.SplitN(platform, "/", 2)
-		if len(parts) != 2 {
-			log.Printf("[%s] invalid platform: %s", repo.Name, platform)
-			continue
-		}
-		goos, goarch := parts[0], parts[1]
-		bin := fmt.Sprintf("%s-%s-%s", repo.Name, goos, goarch)
-		out := filepath.Join(artifactsDir, bin)
-
-		env := os.Environ()
-		env = append(env,
-			"GOOS="+goos,
-			"GOARCH="+goarch,
-			"CGO_ENABLED=0",
-			"SHORT_SHA="+shortSHA,
-			"OUTPUT="+out,
-			"WORKSPACE="+workDir,
-		)
-		for k, v := range repo.Env {
-			env = append(env, fmt.Sprintf("%s=%s", k, expandEnv(v)))
-		}
-
-		cmdStr := goBin + " " + repo.BuildArgs
-		log.Printf("[%s][%s/%s] RUN: %s", repo.Name, goos, goarch, cmdStr)
-		if err := runCommand(repoDir, env, "bash", "-c", cmdStr); err != nil {
-			log.Fatalf("[%s][%s/%s] build failed: %v", repo.Name, goos, goarch, err)
-		}
-	}
-
-	_ = os.WriteFile(lastSHAFile, []byte(shortSHA), 0644)
-	log.Printf("[%s] completed, SHA=%s", repo.Name, shortSHA)
+	return run(filepath.Dir(dir), nil, "git", "clone", "--depth=1", url, dir)
 }
 
 func main() {
@@ -171,50 +128,33 @@ func main() {
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
 	v.AddConfigPath(".")
-
 	if err := v.ReadInConfig(); err != nil {
-		log.Fatalf("Error reading config file: %v", err)
+		log.Fatal(err)
+	}
+	var root Root
+	if err := v.Unmarshal(&root); err != nil {
+		log.Fatal(err)
 	}
 
-	var cfg RootConfig
-	if err := v.Unmarshal(&cfg); err != nil {
-		log.Fatalf("Error unmarshalling config: %v", err)
+	repo := mustEnv("REPO")
+	ref := mustEnv("REF")
+	plat := mustEnv("PLATFORM")
+
+	rc, ok := root.Assets[repo]
+	if !ok {
+		log.Fatalf("repo %s not in config", repo)
 	}
 
-	dg := expandEnv(cfg.Globals.DefaultGoVersion)
-	if dg == "" {
-		dg = "1.24"
+	if err := compile(repo, ref, plat, rc, root.Globals); err != nil {
+		log.Fatal("build failed:", err)
 	}
-	cfg.Globals.DefaultGoVersion = dg
-	log.Printf("Using default_go_version = %q", dg)
+	log.Println("✔︎ done")
+}
 
-	for i, r := range cfg.Repos {
-		r.Version = expandEnv(r.Version)
-		r.Branch = expandEnv(r.Branch)
-		r.GoVersion = expandEnv(r.GoVersion)
-		for k, v := range r.Env {
-			r.Env[k] = expandEnv(v)
-		}
-
-		// fallback version -> branch
-		if strings.TrimSpace(r.Version) == "" {
-			r.Version = r.Branch
-		}
-		if r.GitURL == "" {
-			log.Fatalf("repo[%d] name=%s: git_url is required", i, r.Name)
-		}
-		if r.Version == "" {
-			log.Fatalf("repo[%d] name=%s: both version and branch are empty", i, r.Name)
-		}
-		if len(r.Platforms) == 0 {
-			log.Fatalf("repo[%d] name=%s: platforms must be defined", i, r.Name)
-		}
-
-		cfg.Repos[i] = r
+func mustEnv(k string) string {
+	v := os.Getenv(k)
+	if v == "" {
+		log.Fatalf("required env %s", k)
 	}
-
-	for _, repo := range cfg.Repos {
-		log.Printf(">>> Building %s @ %s", repo.Name, repo.Version)
-		orchestrateOne(cfg.Globals, repo)
-	}
+	return v
 }
