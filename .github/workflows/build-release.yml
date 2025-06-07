@@ -1,168 +1,192 @@
-name: Build & Release All Repositories
+name: Advanced Multi-Repo Build
 
 on:
   workflow_dispatch:
     inputs:
-      singbox_version:
-        description: "Sing-Box (tag/branch/commit), default: branch: dev-next"
-        required: false
-        default: ""
-      xraycore_version:
-        description: "Xray-Core (tag/branch/commit), default: branch: main"
-        required: false
-        default: ""
-  push:
-   branches-ignore:
-     - '*'
+      refs:      { description: "Comma-separated refs (e.g., main,v2.8.0,commit_sha)", default: "main,main-next,dev-next" }
+      platforms: { description: "Comma-separated platforms (e.g., linux/amd64,windows/amd64)", default: "linux/amd64,linux/arm64,windows/amd64" }
+  schedule:
+    - cron: '0 0 * * *'
+
+env:
+  DEFAULT_WORKSPACE_DIR: workspace
 
 jobs:
-  build:
+  prepare-assets:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
     steps:
-      - name: Restore sing-box SHA cache
-        uses: actions/cache@v4
-        with:
-          key: last-sha-sing-box-${{ github.ref_name }}
-          path: workspace/sing-box/.last_build_sha
-
-      - name: Restore xray-core SHA cache
-        uses: actions/cache@v4
-        with:
-          key: last-sha-xray-core-${{ github.ref_name }}
-          path: workspace/xray-core/.last_build_sha
-
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Determine Sing-Box Version
-        id: sb_ver
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const inputVer = "${{ github.event.inputs.singbox_version }}".trim();
-            if (inputVer !== "") {
-              return { version: inputVer };
-            }
-            return { version: "" };
-      - name: Determine Xray-Core Version
-        id: xr_ver
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const inputVer = "${{ github.event.inputs.xraycore_version }}.trim()";
-            if (inputVer && inputVer.trim() !== "") {
-              return { version: inputVer };
-            }
-            return { version: "" };
-      - name: Clone Target Repos
-        env:
-          SINGBOX_VERSION: ${{ steps.sb_ver.outputs.singbox_version }}
-          XRAY_VERSION:     ${{ steps.xr_ver.outputs.xraycore_version }}
+      - id: generate
+        name: Generate and Validate Build Matrix
         run: |
-          set -eux
+          set -e
+          FINAL_MATRIX_JSON="[]"
 
-          mkdir -p workspace
-          if [ -n "${SINGBOX_VERSION}" ]; then
-            echo "Cloning sing-box at version ${SINGBOX_VERSION}"
-            git clone --depth 1 --branch "${SINGBOX_VERSION}" https://github.com/sagernet/sing-box.git workspace/sing-box
+          # --- 配置区 ---
+          # 在这里集中管理所有仓库的配置，方便未来扩展。
+          #
+          # 格式说明:
+          #   每个仓库的配置是一个用分号(;)分隔的字符串。
+          #   顺序和含义如下:
+          #   1. Git仓库URL        (repo_url)
+          #   2. Go语言版本         (go_ver)
+          #   3. LDFLAGS模板        (ldflags) - 用于注入版本等信息，可使用 ${REPO_TAG}, ${REPO_SHORT_SHA} 等占位符。
+          #   4. Go构建标签(tags)    (tags) - 多个标签用逗号(,)分隔。
+          #   5. Go构建目标路径      (target) - 例如 "./" 或 "./cmd/app"。
+          #
+          # 注意：如果某一项没有值，请保留分号以作占位，例如 `...;ldflags_val;;target_val` 表示 tags 为空。
+          
+          declare -A REPOS
+          REPOS["sing-box"]="https://github.com/sagernet/sing-box.git;1.24.4;-X github.com/sagernet/sing-box/constant.Version=\${REPO_TAG};with_gvisor,with_quic,with_utls,with_clash_api;./cmd/sing-box"
+          REPOS["xray-core"]="https://github.com/XTLS/Xray-core.git;1.24.4;-X github.com/xtls/xray-core/core.build=\${REPO_SHORT_SHA};;./main"
+
+          declare -A DEFAULT_REFS
+          DEFAULT_REFS["sing-box"]="main,dev-next,main-next"
+          DEFAULT_REFS["xray-core"]="main"
+          DEFAULT_PLATS="linux/amd64,linux/arm64,windows/amd64"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            CHECK_REFS="${{ inputs.refs }}"
+            CHECK_PLATS="${{ inputs.platforms }}"
           else
-            echo "Cloning sing-box at default branch 'dev-next'"
-            git clone --depth 1 --branch "dev-next" https://github.com/sagernet/sing-box.git workspace/sing-box
+            CHECK_REFS="" 
+            CHECK_PLATS="$DEFAULT_PLATS"
           fi
+          
+          PLATS_ARRAY_JSON=$(echo "$CHECK_PLATS" | jq -R 'split(",") | map(select(. != ""))')
 
-          if [ -n "${XRAY_VERSION}" ]; then
-            echo "Cloning xray-core at version ${XRAY_VERSION}"
-            git clone --depth 1 --branch "${XRAY_VERSION}" https://github.com/XTLS/Xray-core.git workspace/xray-core
-          else
-            echo "Cloning xray-core at default branch 'main'"
-            git clone --depth 1 --branch "main" https://github.com/XTLS/Xray-core.git workspace/xray-core
-          fi
+          for repo_name in "${!REPOS[@]}"; do
+            
+            IFS=';' read -r repo_url go_ver ldflags tags target <<< "${REPOS[$repo_name]}"
+          
+            if [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
+              CHECK_REFS="${DEFAULT_REFS[$repo_name]}"
+            fi
+          
+            IFS=',' read -ra refs_to_check <<< "$CHECK_REFS"
 
-      - name: Setup Go (goenv)
+            for ref in "${refs_to_check[@]}"; do
+              echo "Checking if ref '$ref' exists in repo '$repo_name'..."
+              if git ls-remote --exit-code --heads --tags "$repo_url" "$ref" >/dev/null 2>&1 || \
+                 git ls-remote --exit-code "$repo_url" "$ref" | grep -q "commit"; then
+                 echo "  -> Ref '$ref' found. Adding combinations to matrix."
+
+                VALID_COMBOS=$(jq -n \
+                  --arg rn "$repo_name" --arg rurl "$repo_url" \
+                  --arg gv "$go_ver" --arg ld "$ldflags" \
+                  --arg tg "$tags" --arg tgt "$target" \
+                  --arg r "$ref" --argjson plats "$PLATS_ARRAY_JSON" \
+                  '
+                  $plats[] | . as $p | {
+                    repo: $rn, repo_url: $rurl, build_go_version: $gv,
+                    build_ldflags: $ld, build_tags: $tg, build_target: $tgt,
+                    ref: $r,
+                    os: ($p | split("/")[0]),
+                    arch: ($p | split("/")[1])
+                  }
+                  '
+                )
+          
+                FINAL_MATRIX_JSON=$(echo "$FINAL_MATRIX_JSON" | jq -c ". += $(echo "$VALID_COMBOS" | jq -s)")
+              else
+                echo "  -> Ref '$ref' NOT found. Skipping."
+              fi
+            done
+          done
+          
+          echo "Final Generated Matrix:"
+          echo "$FINAL_MATRIX_JSON" | jq .
+          echo "matrix=$FINAL_MATRIX_JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare-assets
+    name: 🛠️ Build ${{ matrix.repo }} | ${{ matrix.ref }} | ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare-assets.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ matrix.build_go_version }}
+          cache: false
 
-      - name: Run Orchestrator (Build)
+      - name: Build for ${{ matrix.repo }} - ${{ matrix.ref }} - ${{ matrix.os }}/${{ matrix.arch }}
         env:
-          GO_DEFAULT_VERSION: "1.24.4"
-
-          SINGBOX_VERSION: "${{ steps.sb_ver.outputs.version }}"
-          SINGBOX_BRANCH: "dev-next"
-          SINGBOX_GO_VERSION: "1.23.1"
-          SINGBOX_TAGS: "with_gvisor,with_quic,with_utls,with_clash_api"
-
-          XRAY_VERSION: "${{ steps.xr_ver.outputs.version }}"
-          XRAY_BRANCH: "main"
-          XRAY_GO_VERSION: "1.24.4"
-        run: |
-          go run main.go
-
-      - name: Upload raw-binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: raw-binaries
-          path: workspace/**/artifacts/**
-
-      - name: Save sing-box SHA cache
-        uses: actions/cache@v4
-        with:
-          key: last-sha-sing-box-${{ github.ref_name }}
-          path: workspace/sing-box/.last_build_sha
-
-      - name: Save xray-core SHA cache
-        uses: actions/cache@v4
-        with:
-          key: last-sha-xray-core-${{ github.ref_name }}
-          path: workspace/xray-core/.last_build_sha
-
-  upload:
-    needs: build
-    runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        repo: [sing-box, xray-core]
-        os_arch:
-          - { os: linux,   arch: amd64 }
-          - { os: linux,   arch: arm64 }
-          - { os: windows, arch: amd64 }
-    env:
-      SB_VER: ${{ needs.build.outputs.sb_version }}
-      XR_VER: ${{ needs.build.outputs.xr_version }}
-
-    steps:
-      - name: Download raw binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: raw-binaries
-
-      - name: Determine version
-        id: setver
-        shell: bash
-        run: |
-          if [[ "${{ matrix.repo }}" == "sing-box" ]]; then
-          echo "version=${SB_VER:-dev-next}" >> "$GITHUB_OUTPUT"
-          else
-          echo "version=${XR_VER:-main}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Copy and flatten binary
-        shell: bash
+          REPO_NAME:        ${{ matrix.repo }}
+          REPO_URL:         ${{ matrix.repo_url }}
+          TARGET_REF:       ${{ matrix.ref }}
+          TARGET_OS:        ${{ matrix.os }}
+          TARGET_ARCH:      ${{ matrix.arch }}
+          WORKSPACE_DIR:    ${{ env.DEFAULT_WORKSPACE_DIR }}
+          BUILD_TAGS:       ${{ matrix.build_tags }}
+          BUILD_LDFLAGS:    ${{ matrix.build_ldflags }}
+          BUILD_TARGET:     ${{ matrix.build_target }}
         run: |
           set -eux
-          PLAT="${{ matrix.os_arch.os }}-${{ matrix.os_arch.arch }}"
-          SRC="${{ matrix.repo }}/workspace/${{ matrix.repo }}/artifacts/${{ matrix.repo }}-${PLAT}"
-          DST="${{ matrix.repo }}-${{ steps.setver.outputs.version }}-${PLAT}"
-          echo "Copying from: $SRC"
-          echo "        to: $DST"
-          cp "$SRC" "$DST"
+          
+          echo "--> Setting up workspace and cloning source code..."
+          mkdir -p "${WORKSPACE_DIR}"
+          cd "${WORKSPACE_DIR}"
+          echo "Cloning repository from ${REPO_URL}..."
+          git clone "${REPO_URL}" "${REPO_NAME}"
+          cd "${REPO_NAME}"
+          echo "--> Switched to directory: $(pwd)"
+          echo "--> Checking out ref: ${TARGET_REF}"
+          git checkout "${TARGET_REF}"
+          echo "--> Switched to ref '${TARGET_REF}'. Current commit: $(git rev-parse HEAD)"
+          
+          echo "--> Gathering Git metadata..."
+          REPO_SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          REPO_LONG_SHA=$(git rev-parse HEAD)
+          REPO_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          LDFLAGS_TEMPLATE="${BUILD_LDFLAGS}"
+          FINAL_LDFLAGS_TEMPLATE="${LDFLAGS_TEMPLATE} -s -w -buildid="
+          FINAL_LDFLAGS="${FINAL_LDFLAGS_TEMPLATE//\$\{REPO_TAG\}/$REPO_TAG}"
+          FINAL_LDFLAGS="${FINAL_LDFLAGS//\$\{REPO_SHORT_SHA\}/$REPO_SHORT_SHA}"
+          FINAL_LDFLAGS="${FINAL_LDFLAGS//\$\{REPO_LONG_SHA\}/$REPO_LONG_SHA}"
+          
+          echo "--> Preparing build arguments..."
+          export GOOS="${TARGET_OS}"
+          export GOARCH="${TARGET_ARCH}"
+          export CGO_ENABLED=0
+          
+          OUTPUT_NAME="${REPO_NAME}-${TARGET_REF}-${TARGET_OS}-${TARGET_ARCH}"
+          if [ "$GOOS" = "windows" ]; then
+            OUTPUT_NAME="${OUTPUT_NAME}.exe"
+          fi
+          OUTPUT_PATH="../${OUTPUT_NAME}"
+          
+          build_args=( -trimpath -buildvcs=false )
+          if [[ -n "$BUILD_TAGS" ]]; then
+            build_args+=( -tags "$BUILD_TAGS" )
+          fi
+          if [[ -n "$FINAL_LDFLAGS" ]]; then
+            build_args+=( -ldflags "$FINAL_LDFLAGS" )
+          fi
+          build_args+=( -o "$OUTPUT_PATH" )
+          if [[ -n "$BUILD_TARGET" ]]; then
+            build_args+=( "$BUILD_TARGET" )
+          fi
+          
+          echo "--> Compiling..."
+          go mod tidy && go build "${build_args[@]}"
+          
+          echo "--> Build finished. Verifying artifact..."
+          cd ..
+          ls -al
 
-      - name: Upload flattened binary
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo }}-${{ steps.setver.outputs.version }}-${{ matrix.os_arch.os }}-${{ matrix.os_arch.arch }}
-          path: ${{ matrix.repo }}-${{ steps.setver.outputs.version }}-${{ matrix.os_arch.os }}-${{ matrix.os_arch.arch }}
+          name: ${{ matrix.repo }}-${{ matrix.ref }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            ${{ env.DEFAULT_WORKSPACE_DIR }}/${{ matrix.repo }}-${{ matrix.ref }}-${{ matrix.os }}-${{ matrix.arch }}
+            ${{ env.DEFAULT_WORKSPACE_DIR }}/${{ matrix.repo }}-${{ matrix.ref }}-${{ matrix.os }}-${{ matrix.arch }}.exe
+          if-no-files-found: error
+          retention-days: 1
